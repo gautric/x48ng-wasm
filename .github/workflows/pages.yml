@@ -1,0 +1,58 @@
+# Build the x48ng (HP 48GX) WebAssembly port and publish it to GitHub Pages
+# at https://hp48.autric.net/ (custom domain set via dist/wasm/CNAME).
+#
+# The HP 48GX ROM is downloaded from hpcalc.org during the build (see
+# Makefile.wasm) and embedded into x48ng.data; it is never committed.
+name: Deploy HP 48GX WebAssembly to Pages
+
+on:
+  push:
+    branches: [main, wasm]
+  workflow_dispatch:
+
+# Allow the workflow to publish to Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Only one concurrent deploy; let an in-progress run finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (with ui4x submodule)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Emscripten
+        uses: mymindstorm/setup-emsdk@v14
+        with:
+          # Homebrew's emcc reports 6.0.13; emsdk uses its own release tags,
+          # so track the latest stable SDK. The build uses no bleeding-edge
+          # features.
+          version: latest
+
+      - name: Build WebAssembly module (downloads ROM, embeds it)
+        run: make -f Makefile.wasm
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist/wasm
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -9,3 +9,12 @@ dist/x48ng-dumprom
 dist/x48ng-mkcard
 /compile_commands.json
 /.depend
+
+# WebAssembly build (Makefile.wasm)
+# build/ holds the downloaded ROM, its zip and local screenshots.
+/build/
+# Generated emscripten artifacts; x48ng.data embeds the copyrighted ROM, so
+# none of these are committed -- the Pages workflow rebuilds them in CI.
+/dist/wasm/x48ng.js
+/dist/wasm/x48ng.wasm
+/dist/wasm/x48ng.data

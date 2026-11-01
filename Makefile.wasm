@@ -1,0 +1,115 @@
+# Makefile.wasm -- build x48ng (HP 48GX) for the browser with Emscripten.
+#
+#   make -f Makefile.wasm            # download ROM + build into dist/wasm/
+#   make -f Makefile.wasm serve      # build, then serve on http://localhost:8000
+#   make -f Makefile.wasm clean      # remove build artifacts
+#
+# Requires: emscripten (emcc), curl, unzip, python3.
+#
+# The HP 48GX ROM (gxrom-r) is downloaded from hpcalc.org at build time and
+# preloaded into the WebAssembly module's virtual filesystem at "/rom".  It is
+# never committed to the repository.
+
+EMCC ?= emcc
+
+VERSION_MAJOR = 1
+VERSION_MINOR = 3
+PATCHLEVEL    = 1
+
+PORT ?= 8000
+
+BUILD_DIR = build/wasm
+OUT_DIR   = dist/wasm
+
+ROM_URL = https://www.hpcalc.org/hp48/pc/emulators/gxrom-r.zip
+ROM_ZIP = $(BUILD_DIR)/gxrom-r.zip
+ROM     = $(BUILD_DIR)/gxrom-r
+
+TARGET = $(OUT_DIR)/x48ng.js
+
+INCLUDES = -Isrc/wasm/shim -Isrc -Isrc/core -Isrc/ui4x/src
+
+# -Isrc/wasm/shim comes first so our tiny <glib.h>/<lua.h>/<lauxlib.h> shadow
+# the system ones.
+CFLAGS = \
+	-O2 \
+	-sUSE_SDL=2 \
+	-DHAS_SDL=1 -DHAS_SDL2=1 \
+	-D_GNU_SOURCE=1 \
+	-DVERSION_MAJOR=$(VERSION_MAJOR) \
+	-DVERSION_MINOR=$(VERSION_MINOR) \
+	-DPATCHLEVEL=$(PATCHLEVEL) \
+	$(INCLUDES) \
+	-Wno-unused-function \
+	-Wno-unused-variable \
+	-Wno-unused-but-set-variable
+
+LDFLAGS = \
+	-O2 \
+	-sUSE_SDL=2 \
+	-sASYNCIFY \
+	-sASYNCIFY_STACK_SIZE=65536 \
+	-sALLOW_MEMORY_GROWTH=1 \
+	-sINITIAL_MEMORY=33554432 \
+	-sSTACK_SIZE=5242880 \
+	-sFORCE_FILESYSTEM=1 \
+	-sEXPORTED_RUNTIME_METHODS=ccall,cwrap,callMain,FS,IDBFS,addRunDependency,removeRunDependency \
+	-lidbfs.js \
+	--preload-file $(ROM)@/rom
+
+# Saturn core (emulate.c is pulled in via emulate_wasm.c for the pause() override;
+# debugger.c and the pty-based serial.c are intentionally excluded).
+SRCS = \
+	src/wasm/main_wasm.c \
+	src/wasm/emulate_wasm.c \
+	src/wasm/serial_wasm.c \
+	src/wasm/ui_stubs_wasm.c \
+	src/wasm/glib_shim.c \
+	src/core/init.c \
+	src/core/memory.c \
+	src/core/registers.c \
+	src/core/persistence.c \
+	src/core/timers.c \
+	src/romio.c \
+	src/emulator_api.c \
+	src/ui4x/src/api.c \
+	src/ui4x/src/sdl.c \
+	src/ui4x/src/sdl_bitmaps.c \
+	src/ui4x/src/sdl_fonts.c \
+	src/ui4x/src/48gx.c \
+	src/ui4x/src/48sx.c \
+	src/ui4x/src/49g.c \
+	src/ui4x/src/40g.c \
+	src/ui4x/src/50g.c
+
+.PHONY: all wasm serve clean distclean rom
+
+all: wasm
+
+rom: $(ROM)
+
+$(ROM):
+	@mkdir -p $(BUILD_DIR)
+	@echo "==> Downloading HP 48GX ROM (gxrom-r) from hpcalc.org"
+	curl -fsSL "$(ROM_URL)" -o $(ROM_ZIP)
+	@echo "==> Extracting ROM"
+	unzip -p $(ROM_ZIP) gxrom-r > $(ROM)
+	@echo "==> ROM ready: $(ROM) ($$(wc -c < $(ROM)) bytes)"
+
+wasm: $(ROM) | $(OUT_DIR)
+	@echo "==> Building x48ng WebAssembly module"
+	$(EMCC) $(CFLAGS) $(SRCS) $(LDFLAGS) -o $(TARGET)
+	@echo "==> Done. Artifacts in $(OUT_DIR)/ (x48ng.js, x48ng.wasm, x48ng.data)"
+
+$(OUT_DIR):
+	@mkdir -p $(OUT_DIR)
+
+serve: wasm
+	@echo "==> Serving $(OUT_DIR) at http://localhost:$(PORT)/  (Ctrl-C to stop)"
+	cd $(OUT_DIR) && python3 -m http.server $(PORT)
+
+clean:
+	rm -f $(OUT_DIR)/x48ng.js $(OUT_DIR)/x48ng.wasm $(OUT_DIR)/x48ng.data
+
+distclean: clean
+	rm -rf $(BUILD_DIR)

@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark" />
+    <title>x48ng WebAsm version (serial / state) | Greg. I/O</title>
+    <meta
+      name="description"
+      content="HP 48 GX Saturn CPU emulator (x48ng) compiled to WebAssembly. Serial, state persistence and HOME folder upload are browser built-in."
+    />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='5' fill='%2314171c'/%3E%3Crect x='7' y='5' width='18' height='8' rx='1.5' fill='%236ea8fe'/%3E%3Cg fill='%239aa2ad'%3E%3Crect x='7' y='16' width='4' height='4' rx='1'/%3E%3Crect x='14' y='16' width='4' height='4' rx='1'/%3E%3Crect x='21' y='16' width='4' height='4' rx='1'/%3E%3Crect x='7' y='22' width='4' height='4' rx='1'/%3E%3Crect x='14' y='22' width='4' height='4' rx='1'/%3E%3Crect x='21' y='22' width='4' height='4' rx='1'/%3E%3C/g%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="x48ng-ui.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="https://g.autric.net/">Greg. I/O</a>
+      <nav class="site-nav">
+        <a href="https://g.autric.net/apropos/">About</a>
+        <a href="https://g.autric.net/blog/">Blog</a>
+        <a href="https://g.autric.net/other/">Other</a>
+        <a href="https://g.autric.net/contact/">Contact</a>
+      </nav>
+    </header>
+
+    <main class="page">
+      <h1>HP 48 GX WebAssembly</h1>
+      <p class="subtitle">
+        Saturn CPU emulator compiled to WebAssembly · Serial / State / HOME folder are browser builtin
+      </p>
+
+      <section class="toolbar">
+        <button id="btn-serial" type="button" disabled>Connect serial</button>
+        <span id="serial-status" class="status">Serial: initialising…</span>
+        <span class="spacer"></span>
+        <button id="btn-menu" type="button" title="Menu" aria-label="Menu" disabled>☰</button>
+        <button id="btn-upload" type="button" disabled>HOME + folder ↻</button>
+        <button id="btn-clear" type="button" disabled>Clear memory &amp; reload</button>
+      </section>
+
+      <section class="calc-wrap">
+        <div id="drop-zone" class="drop-zone">
+          <canvas
+            id="canvas"
+            class="calc-canvas"
+            tabindex="-1"
+            oncontextmenu="event.preventDefault()"
+          ></canvas>
+          <div id="drop-hint" class="drop-hint">Drop file to send over the wire</div>
+        </div>
+        <div id="run-status" class="status run-status">Waiting for the calculator…</div>
+        <progress id="dl-progress" class="dl-progress" value="0" max="100" hidden></progress>
+      </section>
+
+      <p class="hint">
+        Drag a <code>.rpl</code> or <code>.hp</code> file onto the calculator to upload it to the HP 48
+        over the serial wire (put the calculator in receive mode first).
+      </p>
+
+      <input id="file-input" type="file" accept=".rpl,.hp,.txt,*/*" hidden />
+
+      <p class="credits">
+        Original (non-WebAssembly) source available on
+        <a href="https://codeberg.org/gwh/x48ng">Codeberg</a>.
+      </p>
+    </main>
+
+    <footer class="site-footer">
+      © 2016 - 2026 <a href="https://g.autric.net/">Greg. I/O</a>
+    </footer>
+
+    <!-- Module configuration must exist before the emscripten glue runs. -->
+    <script src="x48ng-ui.js"></script>
+    <script async src="x48ng.js"></script>
+  </body>
+</html>
