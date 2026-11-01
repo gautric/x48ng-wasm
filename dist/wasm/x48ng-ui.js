@@ -1,11 +1,18 @@
 /* Browser glue for the x48ng (HP 48GX) WebAssembly build.
  *
- * Responsibilities:
+ * Drives the production "Greg. I/O" page markup (#status, #canvas.emscripten,
+ * #serial-btn, #tree-panel, ...) against this repo's WebAssembly module:
  *   - configure the emscripten Module (canvas, status, IDBFS state persistence)
- *   - persist calculator state to IndexedDB (autosave + on hide)
- *   - bridge the Saturn serial UART to the Web Serial API
- *   - drag-and-drop file upload -> inject bytes onto the serial wire
+ *   - boot the emulator once IndexedDB-backed state is loaded
+ *   - bridge the Saturn serial UART to the Web Serial API (poll-based ring
+ *     buffers exported by serial_wasm.c)
+ *   - drag-and-drop a file onto the HOME panel -> inject it over the serial wire
  *   - "Clear memory & reload"
+ *
+ * The live HOME tree, per-object export and keyboard-macro folder operations on
+ * the production site rely on extra WASM exports (x48ng_wasm_home_tree_json,
+ * x48ng_wasm_export_bin_b64, ...) that this build does not provide yet; those
+ * controls degrade gracefully (see setupTree()).
  *
  * This file must load *before* x48ng.js so that `Module` exists when the
  * emscripten runtime boots.
@@ -16,197 +23,241 @@
   var DATADIR = "/x48ng";
   var SERIAL_BAUD = 9600;
 
-  // This script tag sits at the end of <body>, after every element it needs,
-  // so the lookups resolve synchronously.
   function $(id) {
     return document.getElementById(id);
   }
   var el = {
-    serialBtn: $("btn-serial"),
+    status: $("status"),
+    progress: $("progress"),
+    canvas: $("canvas"),
+    serialBtn: $("serial-btn"),
     serialStatus: $("serial-status"),
-    menuBtn: $("btn-menu"),
-    uploadBtn: $("btn-upload"),
-    clearBtn: $("btn-clear"),
-    dropZone: $("drop-zone"),
-    runStatus: $("run-status"),
-    progress: $("dl-progress"),
-    fileInput: $("file-input"),
+    treeToggle: $("tree-toggle"),
+    treePanel: $("tree-panel"),
+    treeRefresh: $("tree-refresh"),
+    newFolderBtn: $("newfolder-btn"),
+    treeRoot: $("tree-root"),
+    treeEmpty: $("tree-empty"),
+    dndHint: $("dnd-hint"),
+    clearBtn: $("clear-btn"),
   };
+
+  /* ------------------------------------------------------------------ */
+  /* keep the page <title>                                               */
+  /*                                                                     */
+  /* The emscripten SDL2 port mirrors the SDL window title to            */
+  /* document.title (emscripten_set_window_title) when the emulator      */
+  /* creates its window — SDL_CreateWindow is called with                */
+  /* ui4x_config.progname (see src/ui4x/src/sdl.c), which would clobber  */
+  /* our <title> at boot. Pin document.title to the page's own title so  */
+  /* those writes are ignored and the browser tab keeps its name.        */
+  /* ------------------------------------------------------------------ */
+  (function pinTitle() {
+    var desired = document.title;
+    try {
+      Object.defineProperty(document, "title", {
+        configurable: true,
+        get: function () {
+          return desired;
+        },
+        set: function () {
+          /* ignore SDL / emscripten window-title writes */
+        },
+      });
+    } catch (e) {
+      /* Fallback for engines that refuse the override: restore after boot. */
+      var restore = function () {
+        var t = document.getElementsByTagName("title")[0];
+        if (t) t.textContent = desired;
+      };
+      restore();
+      setTimeout(restore, 1500);
+    }
+  })();
 
   /* ------------------------------------------------------------------ */
   /* emscripten Module                                                   */
   /* ------------------------------------------------------------------ */
-  var canvas = document.getElementById("canvas");
-
   window.Module = {
-    canvas: canvas,
-    preRun: [
-      function () {
-        // Mount a persistent (IndexedDB-backed) filesystem for the calculator
-        // state/RAM, and load any previously saved data before main() runs.
-        //
-        // State persistence is best-effort: if IndexedDB is missing or blocked
-        // (private windows, "block third-party cookies/site data", some
-        // extensions), the calculator must still boot. So nothing here is ever
-        // allowed to leave a run dependency pending forever -- that would hang
-        // the whole emulator on "Downloading data...".
-        if (typeof indexedDB === "undefined" || !indexedDB) {
-          console.warn("x48ng: IndexedDB unavailable; state will not persist");
-          return;
-        }
-        try {
-          try {
-            Module.FS.mkdir(DATADIR);
-          } catch (e) {
-            /* already exists */
-          }
-          Module.FS.mount(Module.IDBFS, {}, DATADIR);
-          Module.addRunDependency("idbfs-load");
-
-          // Release the dependency exactly once, whichever happens first:
-          // syncfs completing, or a short timeout. Some environments never
-          // deliver the IndexedDB callback at all (it neither succeeds nor
-          // errors); the timeout guarantees main() still starts.
-          var released = false;
-          function releaseIdbfs() {
-            if (released) return;
-            released = true;
-            Module.removeRunDependency("idbfs-load");
-          }
-          var idbfsTimer = setTimeout(function () {
-            if (!released) console.warn("x48ng: IDBFS load timed out; state will not persist this session");
-            releaseIdbfs();
-          }, 2500);
-
-          Module.FS.syncfs(true, function (err) {
-            if (err) console.warn("x48ng: syncfs(load) failed", err);
-            clearTimeout(idbfsTimer);
-            releaseIdbfs();
-          });
-        } catch (e) {
-          console.warn("x48ng: IDBFS setup failed, state will not persist", e);
-        }
-      },
-    ],
+    canvas: el.canvas,
+    // We run main() ourselves, only after the persisted state has been loaded
+    // from IndexedDB (see onRuntimeInitialized). This avoids the data-file run
+    // dependency ever blocking the boot.
+    noInitialRun: true,
     print: function (text) {
       console.log("[x48ng]", text);
     },
     printErr: function (text) {
       console.warn("[x48ng]", text);
     },
-    setStatus: function (text) {
-      if (!el.runStatus) return;
-      if (text) {
-        el.runStatus.textContent = text;
-        var m = text.match(/([^(]+)\((\d+(\.\d+)?)\/(\d+)\)/);
-        if (m && el.progress) {
-          el.progress.hidden = false;
+    setStatus: setStatus,
+    preRun: [
+      function () {
+        // Mount a persistent (IndexedDB-backed) filesystem for the calculator
+        // state/RAM. The actual load happens in onRuntimeInitialized so we can
+        // sequence it before callMain().
+        try {
+          Module.FS.mkdir(DATADIR);
+        } catch (e) {
+          /* already exists */
+        }
+        try {
+          Module.FS.mount(Module.IDBFS, {}, DATADIR);
+        } catch (e) {
+          console.warn("x48ng: IDBFS mount failed, state will not persist", e);
+        }
+      },
+    ],
+    onRuntimeInitialized: function () {
+      loadStateThenBoot();
+    },
+  };
+
+  if (el.status) el.status.textContent = "Downloading…";
+
+  /* ------------------------------------------------------------------ */
+  /* status / progress                                                   */
+  /* ------------------------------------------------------------------ */
+  function setStatus(text) {
+    if (!el.status) return;
+    if (text) {
+      var m = text.match(/([^(]+)\((\d+(\.\d+)?)\/(\d+)\)/);
+      if (m) {
+        el.status.textContent = m[1];
+        if (el.progress) {
+          el.progress.style.display = "";
           el.progress.value = parseInt(m[2], 10) * 100;
           el.progress.max = parseInt(m[4], 10) * 100;
         }
       } else {
-        // Empty status == emscripten finished loading all run dependencies.
-        // Clear the "Downloading data..." text immediately rather than waiting
-        // for onRuntimeInitialized, so the message never appears to hang.
-        el.runStatus.textContent = "";
-        if (el.progress) el.progress.hidden = true;
+        el.status.textContent = text;
       }
-    },
-    onRuntimeInitialized: function () {
-      onReady();
-    },
-  };
-
-  // Mirror emscripten's default download status wording before the runtime
-  // has a chance to call setStatus.
-  if (el.runStatus) el.runStatus.textContent = "Downloading…";
+    } else {
+      el.status.textContent = "";
+      if (el.progress) el.progress.style.display = "none";
+    }
+  }
 
   /* ------------------------------------------------------------------ */
-  /* once the wasm runtime is up                                         */
+  /* boot: load persisted state from IndexedDB, then run main()          */
   /* ------------------------------------------------------------------ */
   var api = null;
+  var booted = false;
+
+  function loadStateThenBoot() {
+    // State persistence is best-effort. If IndexedDB is missing/blocked, or the
+    // syncfs callback never fires (private windows, some extensions), boot
+    // anyway rather than hang on "Downloading data...".
+    var started = false;
+    function boot() {
+      if (started) return;
+      started = true;
+      setStatus("");
+      try {
+        Module.callMain([]);
+      } catch (e) {
+        if (e && e.name === "ExitStatus") {
+          console.log("[x48ng] exit status " + e.status);
+        } else {
+          el.status.className = "error";
+          el.status.textContent = "Emulator error — see log.";
+          console.error("[x48ng] fatal", e);
+          throw e;
+        }
+      }
+      onReady();
+    }
+
+    if (typeof indexedDB === "undefined" || !indexedDB) {
+      console.warn("x48ng: IndexedDB unavailable; state will not persist");
+      boot();
+      return;
+    }
+    var timer = setTimeout(function () {
+      if (!started) console.warn("x48ng: IDBFS load timed out; state will not persist this session");
+      boot();
+    }, 2500);
+    try {
+      Module.FS.syncfs(true, function (err) {
+        if (err) console.warn("x48ng: syncfs(load) failed", err);
+        clearTimeout(timer);
+        boot();
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      console.warn("x48ng: syncfs(load) threw", e);
+      boot();
+    }
+  }
 
   function onReady() {
+    if (booted) return;
+    booted = true;
+
     api = {
       saveState: Module.cwrap("wasm_save_state", null, []),
       serialSetConnected: Module.cwrap("wasm_serial_set_connected", null, ["number"]),
-      serialIsConnected: Module.cwrap("wasm_serial_is_connected", "number", []),
       serialTxRead: Module.cwrap("wasm_serial_tx_read", "number", []),
-      serialTxAvailable: Module.cwrap("wasm_serial_tx_available", "number", []),
       serialRxWrite: Module.cwrap("wasm_serial_rx_write", "number", ["number"]),
     };
 
-    // The virtual wire is always up in the C backend, so the calculator can
-    // transmit and can receive drag-and-dropped files even without a physical
-    // serial port; no need to toggle it here.
-    enableUi();
+    setupInput();
     setupPersistence();
     setupSerial();
-    setupFileUpload();
-
-    el.runStatus.textContent = "Calculator ready.";
-    setTimeout(function () {
-      if (el.runStatus.textContent === "Calculator ready.") el.runStatus.textContent = "";
-    }, 1500);
+    setupTree();
 
     if ("serial" in navigator) {
       setSerialStatus("Serial: virtual wire ready", "");
     } else {
-      setSerialStatus("Serial: Web Serial not supported", "error");
+      setSerialStatus("Serial: unsupported here — use Chrome/Edge over 127.0.0.1 or HTTPS", "err");
       el.serialBtn.disabled = true;
     }
   }
 
-  function enableUi() {
-    el.serialBtn.disabled = false;
-    el.menuBtn.disabled = false;
-    el.uploadBtn.disabled = false;
-    el.clearBtn.disabled = false;
-    el.clearBtn.classList.add("danger");
-    el.serialBtn.classList.add("primary");
-    // Give keyboard focus to the calculator so physical-keyboard input flows.
-    el.menuBtn.addEventListener("click", function () {
-      canvas.focus();
+  function setupInput() {
+    // Keep keyboard focus on the calculator so physical-keyboard input flows.
+    el.canvas.addEventListener("click", function () {
+      el.canvas.focus();
     });
-    canvas.addEventListener("click", function () {
-      canvas.focus();
-    });
+    el.canvas.focus();
   }
 
   function setSerialStatus(text, cls) {
     el.serialStatus.textContent = text;
-    el.serialStatus.className = "status" + (cls ? " " + cls : "");
-  }
-  function setRunStatus(text) {
-    el.runStatus.textContent = text;
+    el.serialStatus.className = cls || "";
   }
 
   /* ------------------------------------------------------------------ */
   /* state persistence                                                   */
   /* ------------------------------------------------------------------ */
+  var cleared = false;
+
   function save() {
-    if (!api) return;
+    if (!api || cleared) return;
     try {
-      api.saveState();
+      api.saveState(); // writes files + FS.syncfs(false) internally
     } catch (e) {
       console.warn("x48ng: save failed", e);
     }
   }
 
   function setupPersistence() {
-    // Periodic autosave.
     setInterval(save, 5000);
-    // Save when the tab is hidden or closed.
     document.addEventListener("visibilitychange", function () {
-      if (document.visibilityState === "hidden") save();
+      if (document.hidden) save();
     });
     window.addEventListener("pagehide", save);
-
     el.clearBtn.addEventListener("click", clearMemory);
   }
 
   function clearMemory() {
-    if (!confirm("Erase the calculator state and reload? This cannot be undone.")) return;
+    if (
+      !window.confirm(
+        "Erase ALL HP 48 memory and restart empty?\n\nThis cannot be undone: variables, folders and the stack will be lost."
+      )
+    )
+      return;
+    cleared = true;
     try {
       ["state", "ram", "port1", "port2"].forEach(function (f) {
         try {
@@ -215,7 +266,8 @@
           /* missing */
         }
       });
-      Module.FS.syncfs(false, function () {
+      Module.FS.syncfs(false, function (err) {
+        if (err) console.error("[clear] syncfs error:", err);
         location.reload();
       });
     } catch (e) {
@@ -225,7 +277,7 @@
   }
 
   /* ------------------------------------------------------------------ */
-  /* Web Serial bridge                                                   */
+  /* Web Serial bridge (poll-based ring buffers)                         */
   /* ------------------------------------------------------------------ */
   var serialPort = null;
   var serialWriter = null;
@@ -233,6 +285,7 @@
   var txPumpTimer = null;
 
   function setupSerial() {
+    el.serialBtn.disabled = false;
     el.serialBtn.addEventListener("click", function () {
       if (serialPort) disconnectSerial();
       else connectSerial();
@@ -241,20 +294,25 @@
 
   async function connectSerial() {
     if (!("serial" in navigator)) {
-      setSerialStatus("Serial: Web Serial not supported", "error");
+      setSerialStatus("Serial: Web Serial not supported", "err");
       return;
     }
     try {
       serialPort = await navigator.serial.requestPort();
-      await serialPort.open({ baudRate: SERIAL_BAUD });
+      await serialPort.open({ baudRate: SERIAL_BAUD, dataBits: 8, stopBits: 1, parity: "none", flowControl: "none" });
       api.serialSetConnected(1);
-      setSerialStatus("Serial: connected @ " + SERIAL_BAUD, "connected");
+      setSerialStatus("Serial: connected @ " + SERIAL_BAUD + " 8N1", "on");
       el.serialBtn.textContent = "Disconnect serial";
       startTxPump();
       startRxPump();
     } catch (e) {
       serialPort = null;
-      setSerialStatus("Serial: " + (e && e.message ? e.message : "connection failed"), "error");
+      if (e && e.name === "NotFoundError") {
+        setSerialStatus("Serial: no port selected", "");
+      } else {
+        setSerialStatus("Serial: " + (e && e.message ? e.message : "connection failed"), "err");
+        console.error("[serial]", e);
+      }
     }
   }
 
@@ -281,10 +339,7 @@
         var res = await serialReader.read();
         if (res.done) break;
         var v = res.value;
-        for (var i = 0; i < v.length; i++) {
-          // Drop if the calc's RX ring is momentarily full.
-          api.serialRxWrite(v[i]);
-        }
+        for (var i = 0; i < v.length; i++) api.serialRxWrite(v[i]);
       }
     } catch (e) {
       /* reader cancelled on disconnect */
@@ -320,47 +375,72 @@
       } catch (e) {}
       serialPort = null;
     }
-    // Drop back to the always-on virtual wire (drag-and-drop still works).
     api.serialSetConnected(0);
     el.serialBtn.textContent = "Connect serial";
     setSerialStatus("Serial: virtual wire ready", "");
   }
 
   /* ------------------------------------------------------------------ */
-  /* drag-and-drop upload -> serial wire                                 */
+  /* HOME tree panel                                                     */
+  /*                                                                     */
+  /* The live tree listing, per-object export and keyboard-macro folder  */
+  /* operations need extra WASM exports this build does not have yet, so */
+  /* those controls are disabled. The toggle and drag-and-drop upload    */
+  /* over the serial wire work with the current module.                  */
   /* ------------------------------------------------------------------ */
-  function setupFileUpload() {
-    ["dragenter", "dragover"].forEach(function (ev) {
-      el.dropZone.addEventListener(ev, function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        el.dropZone.classList.add("dragover");
-      });
-    });
-    ["dragleave", "dragend", "drop"].forEach(function (ev) {
-      el.dropZone.addEventListener(ev, function (e) {
-        e.preventDefault();
-        e.stopPropagation();
-        el.dropZone.classList.remove("dragover");
-      });
-    });
-    el.dropZone.addEventListener("drop", function (e) {
-      var files = e.dataTransfer && e.dataTransfer.files;
-      if (files && files.length) sendFileOverSerial(files[0]);
+  var DND_HINT = el.dndHint ? el.dndHint.textContent : "";
+
+  function hasTreeApi() {
+    return typeof Module._x48ng_wasm_home_tree_json === "function";
+  }
+
+  function setupTree() {
+    el.treeToggle.addEventListener("click", function () {
+      el.treePanel.classList.toggle("hidden");
     });
 
-    el.uploadBtn.addEventListener("click", function () {
-      el.fileInput.click();
+    if (!hasTreeApi()) {
+      if (el.treeEmpty) el.treeEmpty.textContent = "Live HOME tree needs the extended WASM build.";
+      if (el.treeRefresh) el.treeRefresh.disabled = true;
+      if (el.newFolderBtn) el.newFolderBtn.disabled = true;
+    }
+
+    setupDragDrop();
+  }
+
+  function setupDragDrop() {
+    window.addEventListener("dragover", function (e) {
+      e.preventDefault();
     });
-    el.fileInput.addEventListener("change", function () {
-      if (el.fileInput.files.length) sendFileOverSerial(el.fileInput.files[0]);
-      el.fileInput.value = "";
+    window.addEventListener("drop", function (e) {
+      e.preventDefault();
+    });
+
+    function dragOn(e) {
+      e.preventDefault();
+      e.stopPropagation();
+      el.treePanel.classList.add("dragging");
+    }
+    function dragOff() {
+      el.treePanel.classList.remove("dragging");
+    }
+    ["dragenter", "dragover"].forEach(function (ev) {
+      el.treePanel.addEventListener(ev, dragOn);
+    });
+    el.treePanel.addEventListener("dragleave", dragOff);
+    el.treePanel.addEventListener("drop", function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      dragOff();
+      var files = e.dataTransfer && e.dataTransfer.files;
+      if (files && files.length) sendFileOverSerial(files[0]);
     });
   }
 
   async function sendFileOverSerial(file) {
     var buf = new Uint8Array(await file.arrayBuffer());
-    setRunStatus("Sending " + file.name + " (" + buf.length + " bytes) over the wire…");
+    setStatus("Put the HP 48 in receive mode, then sending " + file.name + " (" + buf.length + " bytes)…");
+    if (el.dndHint) el.dndHint.textContent = "Uploading " + file.name + "…";
     var i = 0;
     (function pump() {
       var n = 0;
@@ -375,7 +455,8 @@
       if (i < buf.length) {
         setTimeout(pump, 10);
       } else {
-        setRunStatus("Sent " + file.name + " (" + buf.length + " bytes). Receive it on the HP 48.");
+        setStatus("Sent " + file.name + " (" + buf.length + " bytes). Receive it on the HP 48.");
+        if (el.dndHint) el.dndHint.textContent = DND_HINT;
       }
     })();
   }

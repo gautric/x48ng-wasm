@@ -35,8 +35,7 @@ static serial_ring_t rx_ring; /* browser -> calc            */
 /* The "wire" is always virtually up: the calc can always clock bytes out (to
    the TX ring, drained by the browser when a Web Serial port is attached) and
    in (from the RX ring, fed by a physical port or by drag-and-dropped files).
-   physical_connected only reflects whether a real Web Serial port is open, for
-   display purposes. */
+   physical_connected only reflects whether a real Web Serial port is open. */
 static const bool wire_up = true;
 static bool physical_connected = false;
 static int current_baud = 9600;
@@ -62,13 +61,6 @@ static inline unsigned char ring_pop( serial_ring_t* r )
     return c;
 }
 
-static void update_wire_name( void )
-{
-    if ( ui4x_config.wire_name )
-        free( ui4x_config.wire_name );
-    ui4x_config.wire_name = strdup( physical_connected ? "WebSerial" : "WebSerial (virtual)" );
-}
-
 /* ----------------------------------------------------------------------- */
 /* Core entry points (mirror core/serial.c)                                 */
 /* ----------------------------------------------------------------------- */
@@ -78,7 +70,6 @@ int init_serial( void )
     ring_reset( &tx_ring );
     ring_reset( &rx_ring );
     physical_connected = false;
-    update_wire_name();
     return 1;
 }
 
@@ -133,15 +124,14 @@ void receive_char( void )
 /* ----------------------------------------------------------------------- */
 
 /* Called from JS when a real Web Serial port is opened (1) or closed (0).
-   Only affects the display label and flushes stale TX bytes on disconnect; the
-   virtual wire itself is always up. */
+   Only flushes stale TX bytes on disconnect; the virtual wire itself is always
+   up. */
 EMSCRIPTEN_KEEPALIVE
 void wasm_serial_set_connected( int connected )
 {
     physical_connected = connected ? true : false;
     if ( !physical_connected )
         ring_reset( &tx_ring ); /* nobody left to drain queued output */
-    update_wire_name();
 }
 
 EMSCRIPTEN_KEEPALIVE
