@@ -17,6 +17,7 @@
 .post-content {
   display: flex;
   justify-content: center;
+  margin: 0;
 }
 /* The calculator column: the status line, the download progress bar, the SDL
    canvas and the serial controls stacked and centred. min-width:0 lets the
